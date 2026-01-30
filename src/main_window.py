@@ -218,7 +218,12 @@ class MainWindow(QMainWindow):
     def _copy_pdf_text(self):
         """Copy selected text from PDF."""
         self.pdf_viewer.setFocus()
-        text = self.pdf_viewer.page_widget.get_selected_text()
+        # Find widget with selection
+        text = ""
+        for widget in self.pdf_viewer.page_container.get_page_widgets():
+            if widget.has_selection():
+                text = widget.get_selected_text()
+                break
         if text:
             self.notes_editor.set_clipboard_text(text)
             clipboard = QApplication.clipboard()

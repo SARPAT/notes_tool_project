@@ -27,10 +27,74 @@ class PDFPageWidget(QLabel):
         self._selected_text = ""
         self._is_selecting = False
 
+        # Lazy loading support
+        self._page_number = -1
+        self._is_rendered = False
+        self._placeholder_size = (0, 0)
+
+    def set_placeholder(self, page_num: int, width: int, height: int):
+        """Set up a placeholder for lazy loading."""
+        self._page_number = page_num
+        self._is_rendered = False
+        self._placeholder_size = (width, height)
+        self._page = None
+        self._selection_start = None
+        self._selection_end = None
+        self._selected_text = ""
+
+        # Create a gray placeholder with page number
+        placeholder = QPixmap(width, height)
+        placeholder.fill(QColor(200, 200, 200))
+
+        # Draw page number in center
+        painter = QPainter(placeholder)
+        painter.setPen(QPen(QColor(100, 100, 100)))
+        font = painter.font()
+        font.setPointSize(24)
+        painter.setFont(font)
+        painter.drawText(placeholder.rect(), Qt.AlignmentFlag.AlignCenter, f"Page {page_num + 1}")
+        painter.end()
+
+        self.setPixmap(placeholder)
+        self.setFixedSize(width, height)
+
+    def unload_page(self):
+        """Unload the rendered page and revert to placeholder to free memory."""
+        if self._is_rendered and self._placeholder_size[0] > 0:
+            width, height = self._placeholder_size
+            self._page = None
+            self._is_rendered = False
+            self._selection_start = None
+            self._selection_end = None
+            self._selected_text = ""
+
+            # Recreate placeholder
+            placeholder = QPixmap(width, height)
+            placeholder.fill(QColor(200, 200, 200))
+
+            painter = QPainter(placeholder)
+            painter.setPen(QPen(QColor(100, 100, 100)))
+            font = painter.font()
+            font.setPointSize(24)
+            painter.setFont(font)
+            painter.drawText(placeholder.rect(), Qt.AlignmentFlag.AlignCenter, f"Page {self._page_number + 1}")
+            painter.end()
+
+            self.setPixmap(placeholder)
+
+    def get_page_number(self) -> int:
+        """Return the page number this widget displays."""
+        return self._page_number
+
+    def is_rendered(self) -> bool:
+        """Return whether the page is currently rendered."""
+        return self._is_rendered
+
     def set_page(self, page: fitz.Page, zoom: float = 1.0):
         """Set the PDF page to display."""
         self._page = page
         self._zoom = zoom
+        self._is_rendered = True
         self._selection_start = None
         self._selection_end = None
         self._selected_text = ""
@@ -184,6 +248,44 @@ class PDFPageWidget(QLabel):
             self._render_page()
 
 
+class PDFPageContainer(QWidget):
+    """Container widget holding all PDF pages in a vertical layout."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(10, 10, 10, 10)
+        self._layout.setSpacing(20)
+        self._layout.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self._page_widgets: list[PDFPageWidget] = []
+
+    def clear_pages(self):
+        """Remove all page widgets."""
+        for widget in self._page_widgets:
+            self._layout.removeWidget(widget)
+            widget.deleteLater()
+        self._page_widgets.clear()
+
+    def add_page_widget(self, widget: PDFPageWidget):
+        """Add a page widget to the container."""
+        self._layout.addWidget(widget)
+        self._page_widgets.append(widget)
+
+    def get_page_widget(self, page_num: int) -> PDFPageWidget | None:
+        """Get the widget for a specific page number."""
+        if 0 <= page_num < len(self._page_widgets):
+            return self._page_widgets[page_num]
+        return None
+
+    def get_page_widgets(self) -> list[PDFPageWidget]:
+        """Return all page widgets."""
+        return self._page_widgets
+
+    def page_count(self) -> int:
+        """Return the number of page widgets."""
+        return len(self._page_widgets)
+
+
 class PDFViewer(QWidget):
     """PDF viewer widget with navigation and text selection."""
 
@@ -210,16 +312,18 @@ class PDFViewer(QWidget):
         self.toolbar = self._create_toolbar()
         layout.addWidget(self.toolbar)
 
-        # Scroll area for PDF page
+        # Scroll area for PDF pages
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scroll_area.setStyleSheet("background-color: #525659;")
 
-        # Page widget
-        self.page_widget = PDFPageWidget()
-        self.page_widget.text_selected.connect(self._on_text_selected)
-        self.scroll_area.setWidget(self.page_widget)
+        # Page container for all pages
+        self.page_container = PDFPageContainer()
+        self.scroll_area.setWidget(self.page_container)
+
+        # Connect scroll events for lazy loading
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
 
         layout.addWidget(self.scroll_area)
 
@@ -307,6 +411,9 @@ class PDFViewer(QWidget):
             if self._doc:
                 self._doc.close()
 
+            # Clear existing pages
+            self.page_container.clear_pages()
+
             self._doc = fitz.open(path)
             self._pdf_path = path
             self._current_page = 0
@@ -324,7 +431,23 @@ class PDFViewer(QWidget):
             self.zoom_in_btn.setEnabled(True)
             self.zoom_out_btn.setEnabled(True)
 
-            self._render_current_page()
+            # Create placeholder widgets for all pages
+            for page_num in range(page_count):
+                page = self._doc[page_num]
+                rect = page.rect
+                # Calculate display size at current zoom
+                width = int(rect.width * self._zoom * 2)
+                height = int(rect.height * self._zoom * 2)
+
+                page_widget = PDFPageWidget()
+                page_widget.text_selected.connect(self._on_text_selected)
+                page_widget.set_placeholder(page_num, width, height)
+                self.page_container.add_page_widget(page_widget)
+
+            # Render initial visible pages
+            self._update_visible_pages()
+            self.zoom_label.setText(f"{int(self._zoom * 100)}%")
+
             self.pdf_loaded.emit(path)
             self.status_message.emit(f"Loaded: {path}")
 
@@ -334,33 +457,107 @@ class PDFViewer(QWidget):
             self.status_message.emit(f"Error loading PDF: {e}")
             return False
 
-    def _render_current_page(self):
-        """Render the current page."""
-        if self._doc and 0 <= self._current_page < len(self._doc):
-            page = self._doc[self._current_page]
-            self.page_widget.set_page(page, self._zoom)
-            self.zoom_label.setText(f"{int(self._zoom * 100)}%")
+    def _on_scroll_changed(self, value: int):
+        """Handle scroll changes - update visible pages and page indicator."""
+        self._update_visible_pages()
+        self._update_page_indicator()
+
+    def _update_visible_pages(self):
+        """Render pages in viewport, unload distant ones."""
+        if not self._doc:
+            return
+
+        viewport_top = self.scroll_area.verticalScrollBar().value()
+        viewport_height = self.scroll_area.viewport().height()
+        viewport_bottom = viewport_top + viewport_height
+
+        # Buffer: render 1 page above and below viewport
+        buffer_pixels = viewport_height
+
+        for widget in self.page_container.get_page_widgets():
+            widget_top = widget.y()
+            widget_bottom = widget_top + widget.height()
+            page_num = widget.get_page_number()
+
+            # Check if widget is in viewport (with buffer)
+            in_view = (widget_bottom >= viewport_top - buffer_pixels and
+                       widget_top <= viewport_bottom + buffer_pixels)
+
+            if in_view and not widget.is_rendered():
+                # Render this page
+                page = self._doc[page_num]
+                widget.set_page(page, self._zoom)
+            elif not in_view and widget.is_rendered():
+                # Unload distant page
+                widget.unload_page()
+
+    def _update_page_indicator(self):
+        """Update toolbar page number based on scroll position."""
+        if not self._doc:
+            return
+
+        viewport_center = (self.scroll_area.verticalScrollBar().value() +
+                           self.scroll_area.viewport().height() // 2)
+
+        # Find which page the center of viewport is on
+        for widget in self.page_container.get_page_widgets():
+            widget_top = widget.y()
+            widget_bottom = widget_top + widget.height()
+
+            if widget_top <= viewport_center <= widget_bottom:
+                page_num = widget.get_page_number()
+                if page_num != self._current_page:
+                    self._current_page = page_num
+                    self.page_spin.blockSignals(True)
+                    self.page_spin.setValue(page_num + 1)
+                    self.page_spin.blockSignals(False)
+                break
+
+    def _rerender_all_pages(self):
+        """Re-render all pages after zoom change."""
+        if not self._doc:
+            return
+
+        # Update placeholder sizes and re-render visible pages
+        for widget in self.page_container.get_page_widgets():
+            page_num = widget.get_page_number()
+            page = self._doc[page_num]
+            rect = page.rect
+            width = int(rect.width * self._zoom * 2)
+            height = int(rect.height * self._zoom * 2)
+
+            # Reset as placeholder with new size
+            widget.set_placeholder(page_num, width, height)
+
+        # Re-render visible pages
+        self._update_visible_pages()
+        self.zoom_label.setText(f"{int(self._zoom * 100)}%")
 
     def _on_page_spin_changed(self, value: int):
         """Handle page spinner change."""
         self.go_to_page(value - 1)
 
     def go_to_page(self, page_num: int):
-        """Go to a specific page (0-indexed)."""
+        """Go to a specific page (0-indexed) by scrolling to it."""
         if self._doc and 0 <= page_num < len(self._doc):
             self._current_page = page_num
             self.page_spin.blockSignals(True)
             self.page_spin.setValue(page_num + 1)
             self.page_spin.blockSignals(False)
-            self._render_current_page()
+
+            # Scroll to the page widget
+            widget = self.page_container.get_page_widget(page_num)
+            if widget:
+                self.scroll_area.ensureWidgetVisible(widget, 0, 50)
+                self._update_visible_pages()
 
     def next_page(self):
-        """Go to the next page."""
+        """Go to the next page by scrolling."""
         if self._doc and self._current_page < len(self._doc) - 1:
             self.go_to_page(self._current_page + 1)
 
     def previous_page(self):
-        """Go to the previous page."""
+        """Go to the previous page by scrolling."""
         if self._doc and self._current_page > 0:
             self.go_to_page(self._current_page - 1)
 
@@ -368,32 +565,42 @@ class PDFViewer(QWidget):
         """Increase zoom level."""
         if self._zoom < 3.0:
             self._zoom += 0.25
-            self._render_current_page()
+            self._rerender_all_pages()
 
     def zoom_out(self):
         """Decrease zoom level."""
         if self._zoom > 0.25:
             self._zoom -= 0.25
-            self._render_current_page()
+            self._rerender_all_pages()
 
     def _on_text_selected(self, text: str):
         """Handle text selection from page widget."""
         self.status_message.emit(f"Selected {len(text)} characters. Press 'C' to copy.")
 
+    def _find_widget_with_selection(self) -> PDFPageWidget | None:
+        """Find the page widget that has an active selection."""
+        for widget in self.page_container.get_page_widgets():
+            if widget.has_selection():
+                return widget
+        return None
+
     def keyPressEvent(self, event: QKeyEvent):
         """Handle key press events."""
         if event.key() == Qt.Key.Key_C and not event.modifiers():
-            # Copy selected text
-            text = self.page_widget.get_selected_text()
-            if text:
-                self.text_copied.emit(text)
-                # Also copy to system clipboard
-                QApplication.clipboard().setText(text)
-                self.status_message.emit(f"Copied: {text[:50]}..." if len(text) > 50 else f"Copied: {text}")
+            # Copy selected text - find widget with selection
+            widget = self._find_widget_with_selection()
+            if widget:
+                text = widget.get_selected_text()
+                if text:
+                    self.text_copied.emit(text)
+                    # Also copy to system clipboard
+                    QApplication.clipboard().setText(text)
+                    self.status_message.emit(f"Copied: {text[:50]}..." if len(text) > 50 else f"Copied: {text}")
         elif event.key() == Qt.Key.Key_S and not event.modifiers():
             # Capture screenshot of selection
-            if self.page_widget.has_selection():
-                image = self.page_widget.capture_selection_screenshot()
+            widget = self._find_widget_with_selection()
+            if widget:
+                image = widget.capture_selection_screenshot()
                 if image:
                     self.screenshot_captured.emit(image)
                     self.status_message.emit("Screenshot captured. Press 'P' in notes to paste.")
@@ -426,10 +633,8 @@ class PDFViewer(QWidget):
     def close_pdf(self):
         """Close the current PDF."""
         if self._doc:
-            # Clear page reference before closing doc to avoid render on stale page
-            self.page_widget._page = None
-            self.page_widget.clear_selection()
-            self.page_widget.setPixmap(QPixmap())  # Clear the display
+            # Clear all pages before closing doc
+            self.page_container.clear_pages()
             self._doc.close()
             self._doc = None
             self._pdf_path = ""
