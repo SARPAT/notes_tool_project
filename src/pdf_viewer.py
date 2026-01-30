@@ -5,8 +5,8 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QScrollArea, QLabel, QToolBar,
     QFileDialog, QSpinBox, QHBoxLayout, QPushButton, QApplication
 )
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QKeyEvent, QWheelEvent
-from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QRect
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QKeyEvent, QWheelEvent, QNativeGestureEvent
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QRect, QEvent
 
 
 class PDFPageWidget(QLabel):
@@ -300,8 +300,20 @@ class PDFViewer(QWidget):
         self._current_page = 0
         self._zoom = 1.0
         self._pdf_path = ""
+        self._gesture_base_zoom = 1.0  # Zoom level when gesture started
+        self._in_gesture = False
+        self._pending_rerender = False
 
         self._setup_ui()
+
+        # Throttle timer for smoother gesture updates
+        from PyQt6.QtCore import QTimer
+        self._rerender_timer = QTimer()
+        self._rerender_timer.setSingleShot(True)
+        self._rerender_timer.timeout.connect(self._throttled_rerender)
+
+        self.grabGesture(Qt.GestureType.PinchGesture)
+        self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
 
     def _setup_ui(self):
         """Set up the viewer UI."""
@@ -625,6 +637,84 @@ class PDFViewer(QWidget):
         else:
             # Pass to scroll area
             self.scroll_area.wheelEvent(event)
+
+    def event(self, event):
+        """Override event handler to intercept gesture events."""
+        if event.type() == QEvent.Type.Gesture:
+            return self._gesture_event(event)
+        elif event.type() == QEvent.Type.NativeGesture:
+            return self._native_gesture_event(event)
+        return super().event(event)
+
+    def _gesture_event(self, event):
+        """Handle gesture events, extracting pinch gestures."""
+        pinch = event.gesture(Qt.GestureType.PinchGesture)
+        if pinch:
+            self._pinch_triggered(pinch)
+        return True
+
+    def _throttled_rerender(self):
+        """Throttled re-render for smoother gesture updates."""
+        if self._pending_rerender:
+            self._pending_rerender = False
+            self._rerender_all_pages()
+
+    def _request_rerender(self, immediate=False):
+        """Request a re-render, throttled during gestures."""
+        if immediate or not self._in_gesture:
+            self._rerender_timer.stop()
+            self._rerender_all_pages()
+        else:
+            # Throttle: only re-render every 150ms during gesture
+            self._pending_rerender = True
+            if not self._rerender_timer.isActive():
+                self._rerender_timer.start(150)
+
+    def _pinch_triggered(self, gesture):
+        """Handle pinch gesture to adjust zoom level."""
+        state = gesture.state()
+
+        # Track gesture start
+        if state == Qt.GestureState.GestureStarted:
+            self._gesture_base_zoom = self._zoom
+            self._in_gesture = True
+
+        change_flags = gesture.changeFlags()
+        if change_flags & gesture.ChangeFlag.ScaleFactorChanged:
+            scale = gesture.scaleFactor()
+            new_zoom = self._gesture_base_zoom * scale
+            if 0.25 <= new_zoom <= 3.0:
+                self._zoom = new_zoom
+                self.zoom_label.setText(f"{int(self._zoom * 100)}%")
+                self._request_rerender()
+
+        # Final re-render when gesture is finished
+        if state == Qt.GestureState.GestureFinished:
+            self._in_gesture = False
+            self._request_rerender(immediate=True)
+
+    def _native_gesture_event(self, event: QNativeGestureEvent):
+        """Handle native touchpad gestures (Linux/macOS pinch-to-zoom)."""
+        gesture_type = event.gestureType()
+
+        if gesture_type == Qt.NativeGestureType.BeginNativeGesture:
+            self._gesture_base_zoom = self._zoom
+            self._in_gesture = True
+            return True
+        elif gesture_type == Qt.NativeGestureType.ZoomNativeGesture:
+            # value() returns the zoom delta (positive = zoom in, negative = zoom out)
+            delta = event.value()
+            new_zoom = self._zoom * (1.0 + delta)
+            if 0.25 <= new_zoom <= 3.0:
+                self._zoom = new_zoom
+                self.zoom_label.setText(f"{int(self._zoom * 100)}%")
+                self._request_rerender()
+            return True
+        elif gesture_type == Qt.NativeGestureType.EndNativeGesture:
+            self._in_gesture = False
+            self._request_rerender(immediate=True)
+            return True
+        return False
 
     def get_pdf_path(self) -> str:
         """Get the current PDF path."""
