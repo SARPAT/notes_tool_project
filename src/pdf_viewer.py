@@ -1,12 +1,17 @@
 """PDF viewer component with text selection support."""
 
+from __future__ import annotations
+
+from typing import cast
+
 import fitz  # PyMuPDF
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QScrollArea, QLabel, QToolBar,
-    QFileDialog, QSpinBox, QHBoxLayout, QPushButton, QApplication
+    QFileDialog, QSpinBox, QHBoxLayout, QPushButton, QApplication,
+    QGestureEvent, QPinchGesture
 )
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QKeyEvent, QWheelEvent, QNativeGestureEvent
-from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QRect, QEvent
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QKeyEvent, QWheelEvent, QNativeGestureEvent, QMouseEvent
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QEvent, QTimer
 
 
 class PDFPageWidget(QLabel):
@@ -123,7 +128,7 @@ class PDFPageWidget(QLabel):
         pixmap = QPixmap.fromImage(img)
 
         # Draw selection overlay if active
-        if self._selection_start and self._selection_end:
+        if self._selection_start is not None and self._selection_end is not None:
             pixmap = self._draw_selection_overlay(pixmap)
 
         self.setPixmap(pixmap)
@@ -137,6 +142,9 @@ class PDFPageWidget(QLabel):
         painter.setPen(QPen(QColor(0, 120, 215), 2))
         painter.setBrush(QColor(0, 120, 215, 50))
 
+        # These are guaranteed non-None when this method is called
+        assert self._selection_start is not None
+        assert self._selection_end is not None
         x1 = min(self._selection_start.x(), self._selection_end.x())
         y1 = min(self._selection_start.y(), self._selection_end.y())
         x2 = max(self._selection_start.x(), self._selection_end.x())
@@ -147,8 +155,11 @@ class PDFPageWidget(QLabel):
 
         return result
 
-    def mousePressEvent(self, event):
+    def mousePressEvent(self, ev: QMouseEvent | None):
         """Start text selection."""
+        if ev is None:
+            return
+        event = ev
         if event.button() == Qt.MouseButton.LeftButton:
             self._is_selecting = True
             pos = event.position().toPoint()
@@ -160,8 +171,11 @@ class PDFPageWidget(QLabel):
                 self._selection_start = QPoint(pos.x() - offset_x, pos.y() - offset_y)
                 self._selection_end = self._selection_start
 
-    def mouseMoveEvent(self, event):
+    def mouseMoveEvent(self, ev: QMouseEvent | None):
         """Update selection during drag."""
+        if ev is None:
+            return
+        event = ev
         if self._is_selecting:
             pos = event.position().toPoint()
             pixmap = self.pixmap()
@@ -171,15 +185,18 @@ class PDFPageWidget(QLabel):
                 self._selection_end = QPoint(pos.x() - offset_x, pos.y() - offset_y)
                 self._render_page()
 
-    def mouseReleaseEvent(self, event):
+    def mouseReleaseEvent(self, ev: QMouseEvent | None):
         """Complete selection and extract text."""
+        if ev is None:
+            return
+        event = ev
         if event.button() == Qt.MouseButton.LeftButton and self._is_selecting:
             self._is_selecting = False
             self._extract_selected_text()
 
     def _extract_selected_text(self):
         """Extract text from the selected region."""
-        if not self._page or not self._selection_start or not self._selection_end:
+        if self._page is None or self._selection_start is None or self._selection_end is None:
             return
 
         # Convert screen coordinates to PDF coordinates
@@ -194,7 +211,8 @@ class PDFPageWidget(QLabel):
         rect = fitz.Rect(x1, y1, x2, y2)
 
         # Extract text from region
-        self._selected_text = self._page.get_text("text", clip=rect).strip()
+        text_result = self._page.get_text("text", clip=rect)
+        self._selected_text = str(text_result).strip() if text_result else ""
 
         if self._selected_text:
             self.text_selected.emit(self._selected_text)
@@ -209,7 +227,7 @@ class PDFPageWidget(QLabel):
 
     def capture_selection_screenshot(self) -> QImage | None:
         """Capture a screenshot of the selected region."""
-        if not self._page or not self._selection_start or not self._selection_end:
+        if self._page is None or self._selection_start is None or self._selection_end is None:
             return None
 
         # Convert screen coordinates to PDF coordinates
@@ -307,7 +325,6 @@ class PDFViewer(QWidget):
         self._setup_ui()
 
         # Throttle timer for smoother gesture updates
-        from PyQt6.QtCore import QTimer
         self._rerender_timer = QTimer()
         self._rerender_timer.setSingleShot(True)
         self._rerender_timer.timeout.connect(self._throttled_rerender)
@@ -335,7 +352,9 @@ class PDFViewer(QWidget):
         self.scroll_area.setWidget(self.page_container)
 
         # Connect scroll events for lazy loading
-        self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
+        scrollbar = self.scroll_area.verticalScrollBar()
+        if scrollbar is not None:
+            scrollbar.valueChanged.connect(self._on_scroll_changed)
 
         layout.addWidget(self.scroll_area)
 
@@ -469,7 +488,7 @@ class PDFViewer(QWidget):
             self.status_message.emit(f"Error loading PDF: {e}")
             return False
 
-    def _on_scroll_changed(self, value: int):
+    def _on_scroll_changed(self, _value: int):
         """Handle scroll changes - update visible pages and page indicator."""
         self._update_visible_pages()
         self._update_page_indicator()
@@ -479,8 +498,13 @@ class PDFViewer(QWidget):
         if not self._doc:
             return
 
-        viewport_top = self.scroll_area.verticalScrollBar().value()
-        viewport_height = self.scroll_area.viewport().height()
+        scrollbar = self.scroll_area.verticalScrollBar()
+        viewport = self.scroll_area.viewport()
+        if scrollbar is None or viewport is None:
+            return
+
+        viewport_top = scrollbar.value()
+        viewport_height = viewport.height()
         viewport_bottom = viewport_top + viewport_height
 
         # Buffer: render 1 page above and below viewport
@@ -508,8 +532,12 @@ class PDFViewer(QWidget):
         if not self._doc:
             return
 
-        viewport_center = (self.scroll_area.verticalScrollBar().value() +
-                           self.scroll_area.viewport().height() // 2)
+        scrollbar = self.scroll_area.verticalScrollBar()
+        viewport = self.scroll_area.viewport()
+        if scrollbar is None or viewport is None:
+            return
+
+        viewport_center = scrollbar.value() + viewport.height() // 2
 
         # Find which page the center of viewport is on
         for widget in self.page_container.get_page_widgets():
@@ -596,9 +624,11 @@ class PDFViewer(QWidget):
                 return widget
         return None
 
-    def keyPressEvent(self, event: QKeyEvent):
+    def keyPressEvent(self, a0: QKeyEvent | None):
         """Handle key press events."""
-        if event.key() == Qt.Key.Key_C and not event.modifiers():
+        if a0 is None:
+            return
+        if a0.key() == Qt.Key.Key_C and not a0.modifiers():
             # Copy selected text - find widget with selection
             widget = self._find_widget_with_selection()
             if widget:
@@ -606,9 +636,11 @@ class PDFViewer(QWidget):
                 if text:
                     self.text_copied.emit(text)
                     # Also copy to system clipboard
-                    QApplication.clipboard().setText(text)
+                    clipboard = QApplication.clipboard()
+                    if clipboard:
+                        clipboard.setText(text)
                     self.status_message.emit(f"Copied: {text[:50]}..." if len(text) > 50 else f"Copied: {text}")
-        elif event.key() == Qt.Key.Key_S and not event.modifiers():
+        elif a0.key() == Qt.Key.Key_S and not a0.modifiers():
             # Capture screenshot of selection
             widget = self._find_widget_with_selection()
             if widget:
@@ -618,39 +650,43 @@ class PDFViewer(QWidget):
                     self.status_message.emit("Screenshot captured. Press 'P' in notes to paste.")
             else:
                 self.status_message.emit("No selection. Select a region first, then press 'S'.")
-        elif event.key() == Qt.Key.Key_Right or event.key() == Qt.Key.Key_PageDown:
+        elif a0.key() == Qt.Key.Key_Right or a0.key() == Qt.Key.Key_PageDown:
             self.next_page()
-        elif event.key() == Qt.Key.Key_Left or event.key() == Qt.Key.Key_PageUp:
+        elif a0.key() == Qt.Key.Key_Left or a0.key() == Qt.Key.Key_PageUp:
             self.previous_page()
         else:
-            super().keyPressEvent(event)
+            super().keyPressEvent(a0)
 
-    def wheelEvent(self, event: QWheelEvent):
+    def wheelEvent(self, a0: QWheelEvent | None):
         """Handle mouse wheel for scrolling/zooming."""
-        if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+        if a0 is None:
+            return
+        if a0.modifiers() == Qt.KeyboardModifier.ControlModifier:
             # Zoom with Ctrl+Scroll
-            delta = event.angleDelta().y()
+            delta = a0.angleDelta().y()
             if delta > 0:
                 self.zoom_in()
             elif delta < 0:
                 self.zoom_out()
         else:
             # Pass to scroll area
-            self.scroll_area.wheelEvent(event)
+            self.scroll_area.wheelEvent(a0)
 
-    def event(self, event):
+    def event(self, a0: QEvent | None) -> bool:
         """Override event handler to intercept gesture events."""
-        if event.type() == QEvent.Type.Gesture:
-            return self._gesture_event(event)
-        elif event.type() == QEvent.Type.NativeGesture:
-            return self._native_gesture_event(event)
-        return super().event(event)
+        if a0 is None:
+            return False
+        if a0.type() == QEvent.Type.Gesture:
+            return self._gesture_event(cast(QGestureEvent, a0))
+        elif a0.type() == QEvent.Type.NativeGesture:
+            return self._native_gesture_event(cast(QNativeGestureEvent, a0))
+        return super().event(a0)
 
-    def _gesture_event(self, event):
+    def _gesture_event(self, event: QGestureEvent) -> bool:
         """Handle gesture events, extracting pinch gestures."""
         pinch = event.gesture(Qt.GestureType.PinchGesture)
-        if pinch:
-            self._pinch_triggered(pinch)
+        if pinch is not None:
+            self._pinch_triggered(cast(QPinchGesture, pinch))
         return True
 
     def _throttled_rerender(self):
@@ -670,7 +706,7 @@ class PDFViewer(QWidget):
             if not self._rerender_timer.isActive():
                 self._rerender_timer.start(150)
 
-    def _pinch_triggered(self, gesture):
+    def _pinch_triggered(self, gesture: QPinchGesture):
         """Handle pinch gesture to adjust zoom level."""
         state = gesture.state()
 
@@ -680,7 +716,7 @@ class PDFViewer(QWidget):
             self._in_gesture = True
 
         change_flags = gesture.changeFlags()
-        if change_flags & gesture.ChangeFlag.ScaleFactorChanged:
+        if change_flags & QPinchGesture.ChangeFlag.ScaleFactorChanged:
             scale = gesture.scaleFactor()
             new_zoom = self._gesture_base_zoom * scale
             if 0.25 <= new_zoom <= 3.0:
