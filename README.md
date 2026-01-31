@@ -16,6 +16,8 @@ Built with Python, PyQt6, and PyMuPDF.
 - Page navigation with Previous/Next buttons or arrow keys
 - Jump to any page using the page spinner
 - Zoom in/out (25% - 300%) with buttons or Ctrl+Scroll
+- **Two-finger pinch zoom** on trackpad for intuitive zooming
+- Smooth mouse wheel scrolling through pages
 - Text selection with visual highlight overlay
 - Screenshot capture of selected regions
 
@@ -104,6 +106,8 @@ python main.py
 | `Ctrl+U` | Underline text |
 | `Left/Right` | Previous/Next page |
 | `Ctrl+Scroll` | Zoom in/out |
+| `Pinch gesture` | Zoom in/out (trackpad) |
+| `Scroll` | Navigate through pages |
 | `Esc` | Cancel image placement |
 
 ## Project Structure
